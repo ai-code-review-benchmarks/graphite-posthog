@@ -427,7 +427,6 @@ const APPROVED_DESTINATIONS: string[] = [
     'segment-actions-pushwoosh',
     'segment-actions-schematic',
     'segment-actions-usermotion',
-    'segment-actions-accoil-analytics',
 ]
 
 const HIDDEN_DESTINATIONS = [
