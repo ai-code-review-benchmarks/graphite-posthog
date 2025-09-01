@@ -2,7 +2,7 @@ from posthog.cdp.templates.hog_function_template import HogFunctionTemplate
 
 template: HogFunctionTemplate = HogFunctionTemplate(
     status="beta",
-    free=False,
+    free=True,
     type="destination",
     id="template-accoil",
     name="Accoil",
@@ -10,7 +10,7 @@ template: HogFunctionTemplate = HogFunctionTemplate(
     icon_url="/static/services/accoil.com.png",
     category=["Analytics"],
     code_language="hog",
-    hog="""
+    code="""
 // Determine the call type based on event
 let type := 'track'
 if (event.event == '$pageview') {
@@ -245,7 +245,7 @@ if (res.status >= 400) {
         },
         {
             "key": "group_mrr",
-            "type": "string",
+            "type": "number",
             "label": "Group: MRR",
             "description": "Group monthly recurring revenue (only used for group calls)",
             "default": "{event.properties.$group_set.mrr}",

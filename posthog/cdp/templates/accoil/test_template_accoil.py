@@ -1,8 +1,7 @@
 from inline_snapshot import snapshot
+
+from posthog.cdp.templates.accoil.template_accoil import template as template_accoil
 from posthog.cdp.templates.helpers import BaseHogFunctionTemplateTest
-from posthog.cdp.templates.accoil.template_accoil import (
-    template as template_accoil,
-)
 
 
 def create_inputs(**kwargs):
@@ -24,7 +23,7 @@ def create_inputs(**kwargs):
         "group_createdAt": "",
         "group_status": "active",
         "group_plan": "premium",
-        "group_mrr": "100.0",
+        "group_mrr": 100.0,
         "group_traits_mapping": {},
     }
     inputs.update(kwargs)

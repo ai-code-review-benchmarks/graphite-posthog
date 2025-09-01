@@ -4,6 +4,7 @@ from ._siteapps.template_early_access_features import template as early_access_f
 from ._siteapps.template_hogdesk import template as hogdesk
 from ._siteapps.template_notification_bar import template as notification_bar
 from ._siteapps.template_pineapple_mode import template as pineapple_mode
+from .accoil.template_accoil import template as accoil
 from .activecampaign.template_activecampaign import template as activecampaign
 from .airtable.template_airtable import template as airtable
 from .attio.template_attio import template as attio
@@ -90,6 +91,7 @@ HOG_FUNCTION_TEMPLATES = [
     blank_site_destination,
     blank_site_app,
     slack,
+    accoil,
     activecampaign,
     airtable,
     attio,
