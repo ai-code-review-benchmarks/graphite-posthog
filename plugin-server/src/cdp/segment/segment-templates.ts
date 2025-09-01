@@ -431,6 +431,7 @@ const APPROVED_DESTINATIONS: string[] = [
 
 const HIDDEN_DESTINATIONS = [
     // duplicate destinations
+    'segment-actions-accoil-analytics',
     'segment-actions-snap-conversions',
     'segment-hubspot-cloud',
     'segment-june-actions',
