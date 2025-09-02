@@ -2,10 +2,12 @@ use anyhow::Result;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::checkpoint::export::CheckpointExporter;
 use crate::kafka::types::Partition;
 use crate::rocksdb::deduplication_store::DeduplicationStore;
 
@@ -22,6 +24,15 @@ pub struct CheckpointManager {
 
     /// Flush interval
     flush_interval: Duration,
+
+    // Manages checkpointing and uploads for all consumed topics/partitions.
+    // If None, will no-op (no forced checkpointing or uploads will be performed)
+    _exporter: Option<Arc<CheckpointExporter>>,
+
+    // Handle to the async forced-checkpoint + export loop
+    checkpoint_task: Option<JoinHandle<()>>,
+
+    _checkpoint_limiter: Arc<Semaphore>,
 }
 
 impl CheckpointManager {
@@ -29,19 +40,24 @@ impl CheckpointManager {
     pub fn new(
         stores: Arc<DashMap<Partition, DeduplicationStore>>,
         flush_interval: Duration,
+        exporter: Option<Arc<CheckpointExporter>>,
+        max_concurrent_checkpoints: usize,
     ) -> Self {
         Self {
             stores,
             cancel_token: CancellationToken::new(),
             flush_task: None,
             flush_interval,
+            _exporter: exporter,
+            checkpoint_task: None,
+            _checkpoint_limiter: Arc::new(Semaphore::new(max_concurrent_checkpoints)),
         }
     }
 
-    /// Start the periodic flush task
+    /// Start the periodic flush & export tasks
     pub fn start(&mut self) {
-        if self.flush_task.is_some() {
-            warn!("Checkpoint manager already started");
+        if self.flush_task.is_some() || self.checkpoint_task.is_some() {
+            warn!("checkpoint manager already started");
             return;
         }
 
@@ -229,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_manager_creation() {
         let stores = Arc::new(DashMap::new());
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         assert_eq!(manager.flush_interval, Duration::from_secs(30));
         assert!(manager.flush_task.is_none());
@@ -238,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_manager_start_stop() {
         let stores = Arc::new(DashMap::new());
-        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         // Start the manager
         manager.start();
@@ -252,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_all_empty() {
         let stores = Arc::new(DashMap::new());
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         // Flushing empty stores should succeed
         assert!(manager.flush_all().await.is_ok());
@@ -274,7 +290,7 @@ mod tests {
         stores.insert(Partition::new("topic1".to_string(), 0), store1);
         stores.insert(Partition::new("topic1".to_string(), 1), store2);
 
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         // Flush all should succeed
         assert!(manager.flush_all().await.is_ok());
@@ -291,7 +307,7 @@ mod tests {
 
         stores.insert(Partition::new("topic1".to_string(), 0), store);
 
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         // Create checkpoint
         let checkpoint_path = temp_dir.path().join("checkpoint");
@@ -306,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_partition_not_found() {
         let stores = Arc::new(DashMap::new());
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         let temp_dir = TempDir::new().unwrap();
         let checkpoint_path = temp_dir.path().join("checkpoint");
@@ -331,7 +347,8 @@ mod tests {
         stores.insert(Partition::new("topic1".to_string(), 0), store);
 
         // Create manager with short interval for testing
-        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_millis(100));
+        let mut manager =
+            CheckpointManager::new(stores.clone(), Duration::from_millis(100), None, 2);
 
         // Start the manager
         manager.start();
@@ -346,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_double_start() {
         let stores = Arc::new(DashMap::new());
-        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         // Start once
         manager.start();
@@ -362,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn test_drop_cancels_task() {
         let stores = Arc::new(DashMap::new());
-        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
+        let mut manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30), None, 2);
 
         manager.start();
         let cancel_token = manager.cancel_token.clone();

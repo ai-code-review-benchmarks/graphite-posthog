@@ -91,6 +91,9 @@ pub struct Config {
     #[envconfig(default = "./checkpoints")]
     pub local_checkpoint_dir: String,
 
+    #[envconfig(default = "5")]
+    pub max_concurrent_checkpoints: usize,
+
     pub s3_bucket: Option<String>,
 
     #[envconfig(default = "deduplication-checkpoints")]

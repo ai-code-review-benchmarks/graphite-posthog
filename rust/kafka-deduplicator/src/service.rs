@@ -46,6 +46,7 @@ impl KafkaDeduplicatorService {
             store_config,
             producer_send_timeout: config.producer_send_timeout(),
             flush_interval: config.flush_interval(),
+            max_concurrent_checkpoints: config.max_concurrent_checkpoints,
         };
 
         let processor = DeduplicationProcessor::new(dedup_config)

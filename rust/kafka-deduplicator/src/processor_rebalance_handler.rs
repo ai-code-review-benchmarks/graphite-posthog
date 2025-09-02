@@ -86,6 +86,7 @@ mod tests {
             store_config,
             producer_send_timeout: Duration::from_secs(5),
             flush_interval: Duration::from_secs(120),
+            max_concurrent_checkpoints: 2,
         };
 
         (config, temp_dir)

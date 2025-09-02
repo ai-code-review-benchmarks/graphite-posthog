@@ -33,6 +33,7 @@ pub struct DeduplicationConfig {
     pub store_config: DeduplicationStoreConfig,
     pub producer_send_timeout: Duration,
     pub flush_interval: Duration,
+    pub max_concurrent_checkpoints: usize,
 }
 
 /// Processor that handles deduplication of events using per-partition stores
@@ -65,7 +66,12 @@ impl DeduplicationProcessor {
         let stores = Arc::new(DashMap::new());
 
         // Create checkpoint manager with the stores
-        let mut checkpoint_manager = CheckpointManager::new(stores.clone(), config.flush_interval);
+        let mut checkpoint_manager = CheckpointManager::new(
+            stores.clone(),
+            config.flush_interval,
+            None,
+            config.max_concurrent_checkpoints,
+        );
 
         // Start the periodic flush task
         checkpoint_manager.start();
@@ -408,6 +414,7 @@ mod tests {
             store_config,
             producer_send_timeout: Duration::from_secs(5),
             flush_interval: Duration::from_secs(120),
+            max_concurrent_checkpoints: 2,
         };
 
         (config, temp_dir)
