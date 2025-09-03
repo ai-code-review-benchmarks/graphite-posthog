@@ -300,6 +300,13 @@ export const getDefaultTreeData = (): FileSystemImport[] => [
         iconType: 'plug',
         href: urls.pipeline(PipelineTab.Destinations),
     } as FileSystemImport,
+    {
+        path: `Activity logs`,
+        category: 'Activity',
+        iconType: 'live',
+        href: urls.advancedActivityLogs(),
+        flag: FEATURE_FLAGS.ADVANCED_ACTIVITY_LOGS,
+    } as FileSystemImport,
 ]
 
 export const getDefaultTreeProducts = (): FileSystemImport[] =>
