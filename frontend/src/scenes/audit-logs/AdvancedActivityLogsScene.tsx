@@ -47,12 +47,7 @@ export function AdvancedActivityLogsScene(): JSX.Element {
     return (
         <div>
             <PageHeader caption="Track all changes and activities in your organization" />
-            <LemonTabs
-                activeKey={activeTab}
-                onChange={(key) => setActiveTab(key as 'logs' | 'exports')}
-                tabs={tabs}
-                data-attr="advanced-activity-logs-tabs"
-            />
+            <LemonTabs activeKey={activeTab} onChange={(key) => setActiveTab(key as 'logs' | 'exports')} tabs={tabs} />
         </div>
     )
 }
