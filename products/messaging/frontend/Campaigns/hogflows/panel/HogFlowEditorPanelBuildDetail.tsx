@@ -6,7 +6,8 @@ import { LemonButton, LemonDivider, LemonLabel, LemonSwitch } from '@posthog/lem
 import { ScrollableShadows } from 'lib/components/ScrollableShadows/ScrollableShadows'
 import { urls } from 'scenes/urls'
 
-import { CategorySelect } from '../../../OptOuts/CategorySelect'
+import { CategorySelect } from 'products/messaging/frontend/OptOuts/CategorySelect'
+
 import { HogFlowFilters } from '../filters/HogFlowFilters'
 import { hogFlowEditorLogic } from '../hogFlowEditorLogic'
 import { getHogFlowStep } from '../steps/HogFlowSteps'

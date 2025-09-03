@@ -1,10 +1,13 @@
 import { useValues } from 'kea'
 import { useMemo } from 'react'
 
+import { LemonBadge } from 'lib/lemon-ui/LemonBadge'
+
 import { NODE_HEIGHT, NODE_WIDTH } from '../../constants'
 import { hogFlowEditorLogic } from '../../hogFlowEditorLogic'
 import { HogFlowAction } from '../../types'
 import { getHogFlowStep } from '../HogFlowSteps'
+import { HogFlowActionSchema } from '../types'
 import { StepViewMetrics } from './StepViewMetrics'
 
 export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
@@ -29,6 +32,10 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
             icon: Step?.icon,
         }
     }, [action.type, isSelected])
+
+    // Validate the action against the Zod schema
+    const validationResult = HogFlowActionSchema.safeParse(action)
+    const hasValidationError = !['trigger', 'exit'].includes(action.type) && !validationResult.success
 
     return (
         <div
@@ -61,6 +68,11 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
                     <div className="max-w-full text-[0.3rem]/1.5 text-muted text-ellipsis">{action.description}</div>
                 </div>
             </div>
+            {hasValidationError && (
+                <div className="absolute top-0 right-0 scale-75">
+                    <LemonBadge status="warning" size="small" content="!" position="top-right" />
+                </div>
+            )}
             {mode === 'metrics' && (
                 <div
                     style={{
