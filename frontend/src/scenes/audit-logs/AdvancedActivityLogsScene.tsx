@@ -1,10 +1,13 @@
-import { LemonDivider } from '@posthog/lemon-ui'
+import { useActions, useValues } from 'kea'
+
+import { LemonDivider, LemonTabs } from '@posthog/lemon-ui'
 
 import { PageHeader } from 'lib/components/PageHeader'
 import { SceneExport } from 'scenes/sceneTypes'
 
 import { AdvancedActivityLogFiltersPanel } from './AdvancedActivityLogFiltersPanel'
 import { AdvancedActivityLogsList } from './AdvancedActivityLogsList'
+import { ExportsList } from './ExportsList'
 import { advancedActivityLogsLogic } from './advancedActivityLogsLogic'
 
 export const scene: SceneExport = {
@@ -13,14 +16,43 @@ export const scene: SceneExport = {
 }
 
 export function AdvancedActivityLogsScene(): JSX.Element {
+    const { exports, activeTab } = useValues(advancedActivityLogsLogic)
+    const { setActiveTab } = useActions(advancedActivityLogsLogic)
+
+    const hasExports = exports && exports.length > 0
+
+    const tabs = [
+        {
+            key: 'logs',
+            label: 'Activity logs',
+            content: (
+                <div className="space-y-4">
+                    <AdvancedActivityLogFiltersPanel />
+                    <LemonDivider />
+                    <AdvancedActivityLogsList />
+                </div>
+            ),
+        },
+        ...(hasExports
+            ? [
+                  {
+                      key: 'exports',
+                      label: 'Exports',
+                      content: <ExportsList />,
+                  },
+              ]
+            : []),
+    ]
+
     return (
         <div>
             <PageHeader caption="Track all changes and activities in your organization" />
-            <div className="space-y-4">
-                <AdvancedActivityLogFiltersPanel />
-                <LemonDivider />
-                <AdvancedActivityLogsList />
-            </div>
+            <LemonTabs
+                activeKey={activeTab}
+                onChange={(key) => setActiveTab(key as 'logs' | 'exports')}
+                tabs={tabs}
+                data-attr="advanced-activity-logs-tabs"
+            />
         </div>
     )
 }
