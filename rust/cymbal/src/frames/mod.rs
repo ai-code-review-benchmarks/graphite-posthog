@@ -98,7 +98,7 @@ impl RawFrame {
     pub fn symbol_set_ref(&self) -> Option<String> {
         match self {
             RawFrame::JavaScriptWeb(frame) | RawFrame::LegacyJS(frame) => frame.symbol_set_ref(),
-            RawFrame::JavaScriptNode(_) => None, // Node.js frames don't have symbol sets
+            RawFrame::JavaScriptNode(frame) => frame.chunk_id.clone(),
             RawFrame::Hermes(frame) => frame.chunk_id.clone(),
             // TODO - Python and Go frames don't use symbol sets for frame resolution, but could still use "marker" symbol set
             // to associate a given frame with a given release (basically, a symbol set with no data, just some id,
