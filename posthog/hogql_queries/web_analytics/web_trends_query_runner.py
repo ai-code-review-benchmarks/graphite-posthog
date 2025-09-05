@@ -21,7 +21,7 @@ class WebTrendsQueryRunner(WebAnalyticsQueryRunner[WebTrendsQueryResponse]):
     def use_v2_tables(self) -> bool:
         """Determine table version from team property, default to v2."""
         team_version = getattr(self.team, "web_analytics_pre_aggregated_tables_version", "v2")
-        return team_version == "v2" if team_version else True
+        return team_version != "v1"
 
     @cached_property
     def query_date_range(self):
