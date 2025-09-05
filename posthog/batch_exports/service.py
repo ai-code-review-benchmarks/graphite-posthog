@@ -228,6 +228,20 @@ class BigQueryBatchExportInputs(BaseBatchExportInputs):
 
 
 @dataclass(kw_only=True)
+class DatabricksBatchExportInputs(BaseBatchExportInputs):
+    """Inputs for Databricks export workflow."""
+
+    server_hostname: str
+    http_path: str
+    # TODO - store these in the integration model instead
+    client_id: str
+    client_secret: str
+    catalog: str
+    schema: str
+    table_name: str
+
+
+@dataclass(kw_only=True)
 class HttpBatchExportInputs(BaseBatchExportInputs):
     """Inputs for Http export workflow."""
 
@@ -248,6 +262,7 @@ DESTINATION_WORKFLOWS = {
     "Postgres": ("postgres-export", PostgresBatchExportInputs),
     "Redshift": ("redshift-export", RedshiftBatchExportInputs),
     "BigQuery": ("bigquery-export", BigQueryBatchExportInputs),
+    "Databricks": ("databricks-export", DatabricksBatchExportInputs),
     "HTTP": ("http-export", HttpBatchExportInputs),
     "NoOp": ("no-op", NoOpInputs),
 }
