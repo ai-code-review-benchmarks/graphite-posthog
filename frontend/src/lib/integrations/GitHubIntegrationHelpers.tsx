@@ -11,7 +11,7 @@ export const GitHubRepositorySelectField = ({ integrationId }: { integrationId: 
     const { options, loading } = useRepositories(integrationId)
 
     return (
-        <LemonField name="repositories" label="Repository">
+        <LemonField name="repository" label="Repository">
             <LemonInputSelect
                 mode="single"
                 data-attr="select-github-repository"
