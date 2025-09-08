@@ -1,8 +1,13 @@
-use anyhow::{Context, Result};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc::{Receiver, Sender};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use tokio::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Mutex,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -14,6 +19,8 @@ use crate::store_manager::StoreManager;
 
 const CHECKPOINT_SIZE_HISTOGRAM: &str = "checkpoint_size_bytes";
 const CHECKPOINT_DURATION_HISTOGRAM: &str = "checkpoint_duration_seconds";
+const CHECKPOINT_ERRORS_COUNTER: &str = "checkpoint_errors_total";
+const CHECKPOINT_LAST_TIMESTAMP_GAUGE: &str = "checkpoint_last_timestamp";
 
 pub const CHECKPOINT_NAME_PREFIX: &str = "chkpt";
 
@@ -27,15 +34,23 @@ pub struct CheckpointManager {
     // Checkpoint export module - if populated, locally checkpointed partitions will be backed up remotely
     exporter: Arc<Option<Box<CheckpointExporter>>>,
 
-    checkpoint_sender: Sender<CheckpointRequest>,
+    checkpoint_sender: Sender<Partition>,
 
-    checkpoint_receiver: Arc<Receiver<CheckpointRequest>>,
+    checkpoint_receiver: Arc<Receiver<Partition>>,
 
     /// Cancellation token for the flush task
     cancel_token: CancellationToken,
 
     /// Handles to the checkpoint task loop and async checkpoint spawner
-    checkpoint_tasks: Vec<JoinHandle<()>>,
+    checkpoint_task: Option<JoinHandle<()>>,
+
+    worker_tasks: Vec<JoinHandle<()>>,
+
+    /// Checkpoint counters for each partition (decides full vs incremental uploads)
+    checkpoint_counters: Arc<Mutex<HashMap<Partition, u32>>>,
+
+    /// Checkpointing status for each partition
+    is_checkpointing: Arc<Mutex<HashSet<Partition>>>,
 }
 
 impl CheckpointManager {
@@ -61,13 +76,17 @@ impl CheckpointManager {
             checkpoint_sender,
             checkpoint_receiver: Arc::new(checkpoint_receiver),
             cancel_token: CancellationToken::new(),
-            checkpoint_tasks: Vec::new(),
+            checkpoint_task: None,
+            worker_tasks: Vec::new(),
+            last_checkpoints: Arc::new(Mutex::new(HashMap::new())),
+            checkpoint_counters: Arc::new(Mutex::new(HashMap::new())),
+            is_checkpointing: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Start the periodic flush task
     pub fn start(&mut self) {
-        if self.checkpoint_tasks.len() > 0 {
+        if self.checkpoint_task.is_some() {
             warn!("Checkpoint manager already started");
             return;
         }
@@ -78,16 +97,17 @@ impl CheckpointManager {
         );
 
         let store_manager = self.store_manager.clone();
-        let cancel_recv_loop = self.cancel_token.child_token();
         let checkpoint_interval = self.config.checkpoint_interval.clone();
 
         for task_id in 1..=self.config.max_concurrent_checkpoints {
             let local_task_id = task_id;
             let local_rx: Receiver<Partition> = self.checkpoint_receiver.clone().unwrap();
-            let recv_handle = tokio::spawn(async move {
+            let cancel_worker_loop = self.cancel_token.child_token();
+
+            let worker_handle = tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = cancel_recv_loop.cancelled() => {
+                        _ = cancel_worker_loop.cancelled() => {
                             info!(local_task_id, "Checkpoint manager: receive loop shutting down");
                             break;
                         },
@@ -109,9 +129,10 @@ impl CheckpointManager {
                     }
                 }
             });
-            self.checkpoint_tasks.push(recv_handle);
+            self.worker_tasks.push(worker_handle);
         }
 
+        let cancel_submit_loop = self.cancel_token.child_token();
         let submit_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(checkpoint_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -121,7 +142,7 @@ impl CheckpointManager {
 
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => {
+                    _ = cancel_submit_loop.cancelled() => {
                         info!("Checkpoint manager: submit loop shutting down");
                         break;
                     }
@@ -150,7 +171,7 @@ impl CheckpointManager {
                         // by the StoreManager, the receiver will bail out and continue
                         for partition in partitions {
                             tokio::select! {
-                                _ = cancel.cancelled() => {
+                                _ = cancel_submit_loop.cancelled() => {
                                     info!("Checkpoint manager: inner submit loop shutting down after send attempt for {}:{}", partition.topic(), partition.partition_number());
                                     break;
                                 }
@@ -171,7 +192,7 @@ impl CheckpointManager {
                 }
             }
         });
-        self.checkpoint_tasks.push(submit_handle);
+        self.checkpoint_task = Some(submit_handle);
     }
 
     /// Stop the checkpoint manager
@@ -181,8 +202,12 @@ impl CheckpointManager {
         // Cancel the task
         self.cancel_token.cancel();
 
+        // Stop in-flight submissions to the checkpoint workers immediately
+        self.checkpoint_sender.close();
+        self.checkpoint_task.map(|task| task.abort());
+
         // Wait for tasks to complete
-        for handle in self.checkpoint_tasks.drain(..) {
+        for handle in self.worker_tasks.drain(..) {
             if let Err(e) = handle.await {
                 warn!("Checkpoint manager task failed to join cleanly: {}", e);
             }
@@ -218,6 +243,46 @@ impl CheckpointManager {
         Ok(())
     }
 
+    /// Trigger a checkpoint if one is not already in progress
+    pub async fn maybe_checkpoint(&self, partition: &Partition) -> Result<bool> {
+        // Is this partition due for a checkpoint?
+
+        // Attempt to acquire the checkpoint lock or bail if already in flight
+        {
+            let mut is_checkpointing = self.is_checkpointing.lock().await;
+            if is_checkpointing.contains(&partition) {
+                debug!(partition, "Checkpoint already in progress, skipping");
+                return Ok(false);
+            }
+            self.is_checkpointing.insert(partition.clone());
+        }
+
+        // if we got here, the checkpoint is in progress and locked now...
+
+        // TODO(eli): perhaps wrap with panic::catch_unwind here for extra safety unlocking?
+        let result = self.checkpoint_partition(partition).await;
+
+        // Atomically clear the checkpoint in progress flag
+        {
+            let mut is_checkpointing = self.is_checkpointing.lock().await;
+            is_checkpointing.remove(&partition);
+        }
+
+        // Cleanup old local checkpoints
+        if let Err(e) = self.cleanup_local_checkpoints().await {
+            // TODO(eli): stat this also
+            error!(partition, "Failed to clean up local checkpoints: {}", e);
+        }
+
+        if let Err(e) = result {
+            error!(partition, "Checkpoint failed: {}", e);
+            metrics::counter!(CHECKPOINT_ERRORS_COUNTER, "topic" => partition.topic()).increment(1);
+            return Err(e);
+        }
+
+        Ok(true)
+    }
+
     /// Create a checkpoint for a specific partition; returns an error or the
     /// remote key prefix of the exported checkpoint if successful, or None if
     /// the export failed. TODO(eli): STRAIGHTEN OUT RETURN VALUES THIS IS STUPID
@@ -228,27 +293,22 @@ impl CheckpointManager {
             Some(entry) => entry.value(),
 
             None => {
+                // TODO(eli): stat this also
                 return Err(anyhow::anyhow!(
-                    "Store not found for {}:{}",
-                    partition.topic(),
-                    partition.partition_number(),
-                ))
+                    "Checkpoint aborted: store not found for {:?}",
+                    partition
+                ));
             }
         };
 
-        info!(
-            "Checkpoint for {}:{} => creating local checkpoint at: {:?}",
-            partition.topic(),
-            partition.partition_number(),
-            checkpoint_path
-        );
-
         // Create checkpoint directory with timestamp (microseconds for uniqueness)
         // and ensure the checkpoint name is unique and lexicographically sortable
-        let checkpoint_timestamp = self.generate_checkpoint_timestamp();
+        let checkpoint_timestamp = self.generate_checkpoint_timestamp()?;
         let checkpoint_name = self.build_checkpoint_name(&partition, checkpoint_timestamp);
         let local_checkpoint_path =
             PathBuf::from(&self.config.local_checkpoint_dir).join(&checkpoint_name);
+
+        info!(partition, local_checkpoint_path, "Initiating checkpoint");
 
         // Ensure local checkpoint directory exists
         tokio::fs::create_dir_all(&self.config.local_checkpoint_dir)
@@ -267,11 +327,10 @@ impl CheckpointManager {
                 metrics::histogram!(CHECKPOINT_SIZE_HISTOGRAM).record(checkpoint_size as f64);
 
                 info!(
-                    "Checkpoint for {}:{} => created local checkpoint at {:?} with {} SST files",
-                    partition.topic(),
-                    partition.partition_number(),
-                    &local_checkpoint_path,
-                    sst_files.len()
+                    partition,
+                    local_checkpoint_path,
+                    sst_file_count = sst_files.len(),
+                    "Created local checkpoint",
                 );
             }
 
@@ -285,10 +344,9 @@ impl CheckpointManager {
                 }
 
                 error!(
-                    "Checkpoint for {}:{} => failed local checkpoint at {:?}: {}",
-                    partition.topic(),
-                    partition.partition_number(),
-                    &local_checkpoint_path,
+                    partition,
+                    local_checkpoint_path,
+                    "Local checkpoint failed: {}",
                     error_chain.join(" -> ")
                 );
 
@@ -298,34 +356,68 @@ impl CheckpointManager {
 
         // Update metrics
         if let Err(e) = store.update_metrics() {
-            warn!("Checkpoint for {}:{} => after local checkpoint at {:?}: failed store metrics update: {}",
-            partition.topic(),
-            partition.partition_number(),
-            &local_checkpoint_path,
-            e);
+            warn!(
+                partition,
+                local_checkpoint_path, "Failed store metrics update after local chekcpoint: {}", e
+            );
         }
 
         info!(
-            "Checkpoint for {}:{} => creating remote checkpoint from source: {:?}",
-            partition.topic(),
-            partition.partition_number(),
-            &local_checkpoint_path
+            partition,
+            local_checkpoint_path, "Exporting remote checkpoint",
         );
 
         match self.exporter.as_ref() {
             Some(exporter) => {
+                // Determine if this should be a full upload or incremental
+                let current_part_counter: u32;
+                {
+                    // TODO(eli): the previous checkpoint metadata should contain the
+                    //            associated counter so we don't restart every redeploy
+                    let mut counters = self.checkpoint_counters.lock().await;
+                    let result = counters.get(&partition).unwrap_or(&0_u32);
+                    current_part_counter = *result;
+                    counters.insert(partition.clone(), current_part_counter + 1);
+                }
+                let is_full_upload = current_part_counter % self.config.full_upload_interval == 0;
+
                 // TODO(eli): log error here so return can be handled with ? operator by caller
-                return exporter
-                    .export_checkpoint(&local_checkpoint_path, &checkpoint_name, &store)
-                    .await;
+                match exporter
+                    .export_checkpoint(
+                        &local_checkpoint_path,
+                        &checkpoint_name,
+                        &store,
+                        is_full_upload,
+                    )
+                    .await
+                {
+                    Ok(remote_key_prefix) => {
+                        info!(
+                            partition,
+                            local_checkpoint_path,
+                            remote_key_prefix,
+                            "Checkpoint exported successfully"
+                        );
+
+                        return Ok(Some(remote_key_prefix));
+                    }
+
+                    Err(e) => {
+                        error!(
+                            partition,
+                            local_checkpoint_path, "Checkpoint failed to export: {}", e
+                        );
+                        return Err(e);
+                    }
+                }
             }
 
-            None => {
+            &None => {
                 warn!(
                     "Checkpoint for {}:{} at {:?} => no exporter configured, skipping upload",
                     partition.topic(),
                     partition.partition_number(),
-                    checkpoint_path
+                    &local_checkpoint_path
                 );
 
                 Ok(None)
@@ -349,10 +441,10 @@ impl CheckpointManager {
 
     // Generates a UNIX epoch timestamp in microseconds as a u128
     fn generate_checkpoint_timestamp(&self) -> Result<u128> {
-        SystemTime::now()
+        Ok(SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("failed to generate checkpoint timestamp")?
-            .as_micros()
+            .as_micros())
     }
 
     async fn get_directory_size(&self, path: &Path) -> Result<u64> {
@@ -431,8 +523,15 @@ impl Drop for CheckpointManager {
         self.cancel_token.cancel();
 
         // We can't await in drop, so the task will clean up asynchronously
-        if self.checkpoint_tasks.len() > 0 {
+        if self.checkpoint_task.is_some() {
             debug!("CheckpointManager dropped, flush task will terminate");
+        }
+
+        if self.worker_tasks.len() > 0 {
+            debug!(
+                "CheckpointManager dropped, {} worker tasks will terminate",
+                self.worker_tasks.len()
+            );
         }
     }
 }
@@ -472,10 +571,25 @@ mod tests {
             path: PathBuf::from("test"),
             max_capacity: 1_000_000,
         }));
-        let manager = CheckpointManager::new(stores.clone(), Duration::from_secs(30));
 
-        assert_eq!(manager.flush_interval, Duration::from_secs(30));
-        assert!(manager.flush_task.is_none());
+        // TODO(eli): move this to a test helper and/or default impl
+        let config = CheckpointConfig {
+            checkpoint_interval: Duration::from_secs(30),
+            max_concurrent_checkpoints: 1,
+            full_upload_interval: 1,
+            max_local_checkpoints: 1,
+            local_checkpoint_dir: "test".to_string(),
+            s3_bucket: "test".to_string(),
+            s3_key_prefix: "test".to_string(),
+            aws_region: "test".to_string(),
+            s3_timeout: Duration::from_secs(30),
+        };
+        let manager = CheckpointManager::new(config, stores.clone(), None);
+
+        assert_eq!(manager.config.checkpoint_interval, Duration::from_secs(30));
+        assert!(manager.checkpoint_task.is_none());
+        assert!(manager.exporter.is_none());
+        assert!(manager.worker_tasks.is_empty());
     }
 
     #[tokio::test]
@@ -488,11 +602,11 @@ mod tests {
 
         // Start the manager
         manager.start();
-        assert!(manager.flush_task.is_some());
+        assert!(manager.checkpoint_task.is_some());
 
         // Stop the manager
         manager.stop().await;
-        assert!(manager.flush_task.is_none());
+        assert!(manager.checkpoint_task.is_none());
     }
 
     #[tokio::test]
