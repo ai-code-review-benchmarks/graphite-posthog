@@ -239,6 +239,7 @@ class DatabricksBatchExportInputs(BaseBatchExportInputs):
     catalog: str
     schema: str
     table_name: str
+    use_variant_type: bool = True
 
 
 @dataclass(kw_only=True)

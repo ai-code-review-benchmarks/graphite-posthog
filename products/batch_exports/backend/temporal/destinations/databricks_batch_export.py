@@ -8,6 +8,7 @@ import dataclasses
 
 from django.conf import settings
 
+import pyarrow as pa
 from databricks import sql
 from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sql.exc import OperationalError
@@ -28,7 +29,7 @@ from posthog.temporal.common.logger import get_produce_only_logger, get_write_on
 
 from products.batch_exports.backend.temporal.batch_exports import (
     StartBatchExportRunInputs,
-    default_fields,
+    events_model_default_fields,
     get_data_interval,
     start_batch_export_run,
 )
@@ -37,13 +38,15 @@ from products.batch_exports.backend.temporal.pipeline.entrypoint import execute_
 from products.batch_exports.backend.temporal.pipeline.producer import Producer
 from products.batch_exports.backend.temporal.pipeline.types import BatchExportResult
 from products.batch_exports.backend.temporal.spmc import RecordBatchQueue, wait_for_schema_or_producer
-from products.batch_exports.backend.temporal.utils import handle_non_retryable_errors
+from products.batch_exports.backend.temporal.utils import JsonType, handle_non_retryable_errors
 
 LOGGER = get_write_only_logger(__name__)
 EXTERNAL_LOGGER = get_produce_only_logger("EXTERNAL")
 
 
 NON_RETRYABLE_ERROR_TYPES: list[str] = []
+
+DatabricksField = tuple[str, str]
 
 
 class DatabricksConnectionError(Exception):
@@ -60,6 +63,10 @@ class DatabricksInsertInputs(BatchExportInsertInputs):
     http_path: HTTP Path value for user's all-purpose compute or SQL warehouse.
     client_id: the service principal's UUID or Application ID value.
     client_secret: the Secret value for the service principal's OAuth secret.
+    use_variant_type: whether to use the VARIANT data type for storing JSON data.
+        If False, we will use the STRING data type. Using VARIANT for storing JSON data is recommended by Databricks,
+        however, VARIANT is only available in Databricks Runtime 15.3 and above.
+        See: https://docs.databricks.com/aws/en/semi-structured/variant
     """
 
     # TODO - some of this will go in the integration model once ready
@@ -71,9 +78,9 @@ class DatabricksInsertInputs(BatchExportInsertInputs):
     catalog: str
     schema: str
     table_name: str
+    use_variant_type: bool = True
 
 
-# TODO
 class DatabricksClient:
     # How often to poll for query status. This is a trade-off between responsiveness and number of
     # queries we make to Databricks. 1 second has been chosen rather arbitrarily.
@@ -255,39 +262,162 @@ class DatabricksClient:
     async def use_schema(self, schema: str):
         await self.execute_query(f"USE SCHEMA {schema}", fetch_results=False)
 
+    @contextlib.asynccontextmanager
+    async def managed_table(
+        self,
+        table_name: str,
+        fields: list[DatabricksField],
+        not_found_ok: bool = True,
+        delete: bool = False,
+        create: bool = True,
+    ):
+        """Manage a table in Databricks by ensuring it exists while in context."""
+        if create is True:
+            await self.acreate_table(table_name, fields)
+        yield table_name
+        if delete is True:
+            await self.adelete_table(table_name, not_found_ok)
 
-# TODO
+    async def acreate_table(self, table_name: str, fields: list[DatabricksField]):
+        """Asynchronously create the Databricks delta table if it doesn't exist."""
+        field_ddl = ", ".join(f'"{field[0]}" {field[1]}' for field in fields)
+        await self.execute_query(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                {field_ddl}
+            )
+            USING DELTA
+            COMMENT = 'PostHog generated table'
+            """,
+            fetch_results=False,
+        )
+
+    async def adelete_table(self, table_name: str, not_found_ok: bool = True):
+        """Asynchronously delete the Databricks delta table if it exists."""
+        if not_found_ok is True:
+            await self.execute_query(f"DROP TABLE IF EXISTS {table_name}", fetch_results=False)
+        else:
+            await self.execute_query(f"DROP TABLE {table_name}", fetch_results=False)
+
+
 def databricks_default_fields() -> list[BatchExportField]:
     """Default fields for a Databricks batch export.
 
-    Starting from the common default fields, we add and tweak some fields for
-    backwards compatibility.
+    NOTE: for Databricks, we are exporting a reduced set of fields compared to other destinations as we're not so
+    concerned about supporting legacy fields for backwards compatibility.
     """
-    batch_export_fields = default_fields()
-    batch_export_fields.append(
-        {
-            "expression": "nullIf(JSONExtractString(properties, '$ip'), '')",
-            "alias": "ip",
-        }
-    )
-    # Fields kept for backwards compatibility with legacy apps schema.
-    batch_export_fields.append({"expression": "elements_chain", "alias": "elements"})
-    batch_export_fields.append({"expression": "''", "alias": "site_url"})
-    batch_export_fields.pop(batch_export_fields.index({"expression": "created_at", "alias": "created_at"}))
-
-    # For historical reasons, 'set' and 'set_once' are prefixed with 'people_'.
-    set_field = batch_export_fields.pop(batch_export_fields.index(BatchExportField(expression="set", alias="set")))
-    set_field["alias"] = "people_set"
-
-    set_once_field = batch_export_fields.pop(
-        batch_export_fields.index(BatchExportField(expression="set_once", alias="set_once"))
-    )
-    set_once_field["alias"] = "people_set_once"
-
-    batch_export_fields.append(set_field)
-    batch_export_fields.append(set_once_field)
-
+    batch_export_fields = events_model_default_fields()
+    # add a metadata field for the ingested timestamp to aid with debugging
+    # (this is not strictly the time the data is ingested into Databricks but rather the time we query it from ClickHouse)
+    batch_export_fields.append({"expression": "NOW64()", "alias": "databricks_ingested_timestamp"})
     return batch_export_fields
+
+
+def _get_databricks_fields_from_record_schema(
+    record_schema: pa.Schema, known_variant_columns: list[str]
+) -> list[DatabricksField]:
+    """Maps a PyArrow schema to a list of Databricks fields.
+
+    Arguments:
+        record_schema: The schema of a PyArrow RecordBatch from which we'll attempt to
+            derive Databricks-supported types.
+        known_variant_columns: If a string type field is a known VARIANT column then use VARIANT
+            as its Databricks type.
+    """
+    databricks_schema: list[DatabricksField] = []
+
+    for name in record_schema.names:
+        pa_field = record_schema.field(name)
+
+        if pa.types.is_string(pa_field.type) or isinstance(pa_field.type, JsonType):
+            if pa_field.name in known_variant_columns:
+                databricks_type = "VARIANT"
+            else:
+                databricks_type = "STRING"
+
+        elif pa.types.is_binary(pa_field.type):
+            databricks_type = "BINARY"
+
+        elif pa.types.is_signed_integer(pa_field.type) or pa.types.is_unsigned_integer(pa_field.type):
+            databricks_type = "INTEGER"
+
+        elif pa.types.is_floating(pa_field.type):
+            databricks_type = "FLOAT"
+
+        elif pa.types.is_boolean(pa_field.type):
+            databricks_type = "BOOLEAN"
+
+        elif pa.types.is_timestamp(pa_field.type):
+            databricks_type = "TIMESTAMP"
+
+        elif pa.types.is_list(pa_field.type):
+            databricks_type = "ARRAY"
+
+        else:
+            raise TypeError(f"Unsupported type in field '{name}': '{databricks_type}'")
+
+        databricks_schema.append((name, databricks_type))
+
+    return databricks_schema
+
+
+def _get_databricks_table_settings(
+    model: BatchExportModel | BatchExportSchema | None, record_batch_schema: pa.Schema, use_variant_type: bool
+) -> tuple[list[DatabricksField], pa.Schema, list[str]]:
+    """Get the various table settings for this batch export.
+
+    For the events model, we actually export a reduced set of fields compared to other destinations for a number of reasons:
+    - we do not need to support legacy fields, such as `set` and `set_once`
+    - some fields, such as `ip` and `site_url`, are also present in `properties` so we can ignore these for efficiency
+    - `elements` is not particularly useful in its current form (it is in a custom serialized format)
+    """
+    # we don't export the _inserted_at field
+    record_batch_schema = pa.schema(
+        [field.with_nullable(True) for field in record_batch_schema if field.name != "_inserted_at"]
+    )
+
+    if use_variant_type is True:
+        json_type = "VARIANT"
+        known_variant_columns = ["properties", "person_properties"]
+    else:
+        json_type = "STRING"
+        known_variant_columns = []
+
+    if model is None or (isinstance(model, BatchExportModel) and model.name == "events"):
+        table_fields = [
+            ("uuid", "STRING"),
+            ("event", "STRING"),
+            ("properties", json_type),
+            ("distinct_id", "STRING"),
+            ("team_id", "INTEGER"),
+            ("timestamp", "TIMESTAMP"),
+            ("databricks_ingested_timestamp", "TIMESTAMP"),
+        ]
+    else:
+        table_fields = _get_databricks_fields_from_record_schema(
+            record_batch_schema,
+            known_variant_columns=known_variant_columns,
+        )
+
+    return table_fields, record_batch_schema, known_variant_columns
+
+
+def _get_databricks_merge_config(
+    model: BatchExportModel | BatchExportSchema | None,
+) -> tuple[bool, list[DatabricksField], list[str]]:
+    requires_merge = False
+    merge_key = []
+    update_key = []
+    if isinstance(model, BatchExportModel):
+        if model.name == "persons":
+            requires_merge = True
+            merge_key = [("team_id", "INTEGER"), ("distinct_id", "STRING")]
+            update_key = ["person_version", "person_distinct_id_version"]
+        elif model.name == "sessions":
+            requires_merge = True
+            merge_key = [("team_id", "INTEGER"), ("session_id", "STRING")]
+            update_key = ["end_timestamp"]
+    return requires_merge, merge_key, update_key
 
 
 # TODO
@@ -415,12 +545,11 @@ async def insert_into_databricks_activity_from_stage(inputs: DatabricksInsertInp
 
             return BatchExportResult(records_completed=0, bytes_exported=0)
 
-        # TODO from here
-        table_fields, record_batch_schema, known_variant_columns = _get_snowflake_table_settings(
-            model=model, record_batch_schema=record_batch_schema
+        table_fields, record_batch_schema, known_variant_columns = _get_databricks_table_settings(
+            model=model, record_batch_schema=record_batch_schema, use_variant_type=inputs.use_variant_type
         )
 
-        requires_merge, merge_key, update_key = _get_snowflake_merge_config(model=model)
+        requires_merge, merge_key, update_key = _get_databricks_merge_config(model=model)
 
         data_interval_end_str = dt.datetime.fromisoformat(inputs.data_interval_end).strftime("%Y-%m-%d_%H-%M-%S")
         stage_table_name = (
@@ -429,18 +558,17 @@ async def insert_into_databricks_activity_from_stage(inputs: DatabricksInsertInp
             else inputs.table_name
         )
 
-        async with SnowflakeClient.from_inputs(inputs).connect() as snow_client:
+        async with DatabricksClient.from_inputs(inputs).connect() as databricks_client:
             async with (
-                snow_client.managed_table(
-                    inputs.table_name, data_interval_end_str, table_fields, delete=False
-                ) as snow_table,
-                snow_client.managed_table(
-                    stage_table_name,
-                    data_interval_end_str,
-                    table_fields,
+                databricks_client.managed_table(
+                    table_name=inputs.table_name, fields=table_fields, delete=False
+                ) as databricks_table,
+                databricks_client.managed_table(
+                    table_name=stage_table_name,
+                    fields=table_fields,
                     create=requires_merge,
                     delete=requires_merge,
-                ) as snow_stage_table,
+                ) as databricks_stage_table,
             ):
                 consumer = DatabricksConsumerFromStage(
                     snowflake_client=snow_client,
