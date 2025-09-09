@@ -1178,6 +1178,7 @@ export interface SessionPlayerData {
     end: Dayjs | null
     fullyLoaded: boolean
     sessionRecordingId: SessionRecordingId
+    sessionRetentionPeriodDays: number | null
 }
 
 export enum SessionRecordingUsageType {

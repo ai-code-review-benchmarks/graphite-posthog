@@ -730,6 +730,7 @@ AND properties.$lib != 'web'`
                 bufferedToTime,
                 fullyLoaded,
                 sessionRecordingId,
+                sessionRetentionPeriodDays: meta?.retention_period_days ?? null,
             }),
         ],
 
