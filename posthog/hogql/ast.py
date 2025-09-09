@@ -343,6 +343,14 @@ class SelectViewType(Type):
 
         return self.select_query_type.has_child(name, context)
 
+    def resolve_database_table(self, context: HogQLContext) -> Table:
+        if self.view_name:
+            if context.database is None:
+                raise ResolutionError("Database must be set for queries with views")
+            return context.database.get_table(self.view_name)
+
+        raise ResolutionError("SelectViewType.resolve_database_table called without a view name")
+
     def resolve_column_constant_type(self, name: str, context: HogQLContext) -> ConstantType:
         return self.select_query_type.resolve_column_constant_type(name, context)
 
@@ -397,6 +405,18 @@ class StringType(ConstantType):
 
     def print_type(self) -> str:
         return "String"
+
+
+@dataclass(kw_only=True)
+class StringJSONType(StringType):
+    def print_type(self) -> str:
+        return "JSON"
+
+
+@dataclass(kw_only=True)
+class StringArrayType(StringType):
+    def print_type(self) -> str:
+        return "Array"
 
 
 @dataclass(kw_only=True)
@@ -506,7 +526,7 @@ class FieldType(Type):
     table_type: TableOrSelectType
 
     def resolve_database_field(self, context: HogQLContext) -> Optional[FieldOrTable]:
-        if isinstance(self.table_type, BaseTableType):
+        if isinstance(self.table_type, BaseTableType) or isinstance(self.table_type, SelectViewType):
             table = self.table_type.resolve_database_table(context)
             if table is not None:
                 return table.get_field(self.name)
@@ -519,7 +539,7 @@ class FieldType(Type):
         return True
 
     def resolve_constant_type(self, context: HogQLContext) -> ConstantType:
-        if not isinstance(self.table_type, BaseTableType):
+        if not isinstance(self.table_type, BaseTableType) and not isinstance(self.table_type, SelectViewType):
             return self.table_type.resolve_column_constant_type(self.name, context)
 
         table: Table = self.table_type.resolve_database_table(context)
