@@ -76,7 +76,7 @@ impl CheckpointExporter {
                 }
             };
 
-            return Ok(remote_key_prefix);
+            Ok(remote_key_prefix)
         } else {
             // TODO(eli): stat this
             warn!(
@@ -84,7 +84,8 @@ impl CheckpointExporter {
                 remote_path = remote_key_prefix,
                 "Export failed: uploader not available"
             );
-            return Err(anyhow::anyhow!("Uploader not available"));
+
+            Err(anyhow::anyhow!("Uploader not available"))
         }
     }
 }

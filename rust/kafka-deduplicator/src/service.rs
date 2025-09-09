@@ -59,7 +59,7 @@ impl KafkaDeduplicatorService {
             aws_region: config.aws_region.clone(),
             max_local_checkpoints: config.max_local_checkpoints,
             max_concurrent_checkpoints: config.max_concurrent_checkpoints,
-            s3_timeout: config.s3_timeout().clone(),
+            s3_timeout: config.s3_timeout(),
         };
         let mut checkpoint_manager =
             CheckpointManager::new(checkpoint_config.clone(), store_manager.clone(), None);
