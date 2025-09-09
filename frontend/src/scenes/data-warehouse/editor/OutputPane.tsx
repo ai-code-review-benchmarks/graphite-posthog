@@ -265,6 +265,7 @@ export function OutputPane(): JSX.Element {
     const { featureFlags } = useValues(featureFlagLogic)
 
     const {
+        tabId,
         sourceQuery,
         exportContext,
         editorKey,
@@ -290,7 +291,7 @@ export function OutputPane(): JSX.Element {
 
     const [progressCache, setProgressCache] = useState<Record<string, number>>({})
 
-    const vizKey = useMemo(() => `SQLEditorScene`, [])
+    const vizKey = `SQLEditorScene.${tabId}`
 
     const [selectedRow, setSelectedRow] = useState<Record<string, any> | null>(null)
 
