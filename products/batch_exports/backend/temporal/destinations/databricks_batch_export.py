@@ -1,3 +1,4 @@
+import io
 import json
 import time
 import typing as t
@@ -5,6 +6,7 @@ import asyncio
 import datetime as dt
 import contextlib
 import dataclasses
+import collections.abc
 
 from django.conf import settings
 
@@ -12,6 +14,7 @@ import pyarrow as pa
 from databricks import sql
 from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sql.exc import OperationalError
+from databricks.sql.types import Row
 from structlog.contextvars import bind_contextvars
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
@@ -67,6 +70,11 @@ class DatabricksInsertInputs(BatchExportInsertInputs):
         If False, we will use the STRING data type. Using VARIANT for storing JSON data is recommended by Databricks,
         however, VARIANT is only available in Databricks Runtime 15.3 and above.
         See: https://docs.databricks.com/aws/en/semi-structured/variant
+    use_automatic_schema_evolution: whether to use automatic schema evolution for the merge operation.
+        If True, we will use `WITH SCHEMA EVOLUTION` to enable [automatic schema
+        evolution](https://docs.databricks.com/aws/en/delta/update-schema#automatic-schema-evolution-for-delta-lake-merge).
+        This means the target table will automatically be updated with the schema of the source table (however, no
+        columns will be dropped from the target table).
     """
 
     # TODO - some of this will go in the integration model once ready
@@ -79,6 +87,7 @@ class DatabricksInsertInputs(BatchExportInsertInputs):
     schema: str
     table_name: str
     use_variant_type: bool = True
+    use_automatic_schema_evolution: bool = True
 
 
 class DatabricksClient:
@@ -105,6 +114,7 @@ class DatabricksClient:
         self._connection: None | sql.Connection = None
 
         self.logger = LOGGER.bind(server_hostname=server_hostname, http_path=http_path)
+        self.external_logger = EXTERNAL_LOGGER.bind(server_hostname=server_hostname, http_path=http_path)
 
     @classmethod
     def from_inputs(cls, inputs: DatabricksInsertInputs) -> t.Self:
@@ -168,18 +178,21 @@ class DatabricksClient:
             await asyncio.to_thread(self._connection.close)
             self._connection = None
 
-    async def execute_query(self, query: str, parameters: dict | None = None, fetch_results: bool = True):
+    async def execute_query(
+        self, query: str, parameters: dict | None = None, query_kwargs: dict | None = None, fetch_results: bool = True
+    ) -> list[Row] | None:
         """Execute a query and wait for it to complete.
 
         We run the query in a separate thread to avoid blocking the event loop in the main thread.
         """
+        query_kwargs = query_kwargs or {}
         # TODO - ensure errors are raised correctly
         query_start_time = time.time()
         self.logger.debug("Executing query: %s", query)
 
         with self.connection.cursor() as cursor:
             try:
-                await asyncio.to_thread(cursor.execute, query, parameters)
+                await asyncio.to_thread(cursor.execute, query, parameters, **query_kwargs)
             finally:
                 query_execution_time = time.time() - query_start_time
                 self.logger.debug("Query completed in %.2fs", query_execution_time)
@@ -188,8 +201,9 @@ class DatabricksClient:
                 return
 
             results = await asyncio.to_thread(cursor.fetchall)
-            description = cursor.description
-            return results, description
+            # description = cursor.description
+            # return results, description
+            return results
 
     async def execute_async_query(
         self,
@@ -198,7 +212,7 @@ class DatabricksClient:
         poll_interval: float | None = None,
         fetch_results: bool = True,
         timeout: float = 60 * 60,  # 1 hour
-    ):
+    ) -> list[Row] | None:
         """Execute a query asynchronously and poll for results.
 
         This is useful for long running queries as it means we don't need to maintain a network connection to the
@@ -215,10 +229,11 @@ class DatabricksClient:
             timeout: The timeout (in seconds) to wait for the query to complete.
                 This is more of a safeguard than anything else, just to prevent us waiting forever.
 
+        # TODO - decide what to return (if we need description or not)
         Returns:
             If `fetch_results` is `True`, a tuple containing:
             - The query results as a list of tuples or dicts
-            - The cursor description (containing list of fields in result)
+            # - The cursor description (containing list of fields in result)
             Else when `fetch_results` is `False` we return `None`.
         """
         # TODO - ensure errors are raised correctly
@@ -250,11 +265,12 @@ class DatabricksClient:
             self.logger.debug("Fetching query results")
 
             results = await asyncio.to_thread(cursor.fetchall)
-            description = cursor.description
+            # description = cursor.description
 
             self.logger.debug("Finished fetching query results")
 
-            return results, description
+            # return results, description
+            return results
 
     async def use_catalog(self, catalog: str):
         await self.execute_query(f"USE CATALOG {catalog}", fetch_results=False)
@@ -267,19 +283,26 @@ class DatabricksClient:
         self,
         table_name: str,
         fields: list[DatabricksField],
-        not_found_ok: bool = True,
         delete: bool = False,
-        create: bool = True,
     ):
         """Manage a table in Databricks by ensuring it exists while in context."""
-        if create is True:
-            await self.acreate_table(table_name, fields)
+        # log if we're creating a permanent table
+        if delete is False:
+            self.external_logger.info("Creating Databricks table %s", table_name)
+        else:
+            self.logger.info("Creating Databricks table %s", table_name)
+
+        await self.acreate_table(table_name, fields)
+
         yield table_name
+
         if delete is True:
-            await self.adelete_table(table_name, not_found_ok)
+            self.logger.info("Deleting Databricks table %s", table_name)
+            await self.adelete_table(table_name)
 
     async def acreate_table(self, table_name: str, fields: list[DatabricksField]):
         """Asynchronously create the Databricks delta table if it doesn't exist."""
+        # TODO - add partition by timestamp if it exists?
         field_ddl = ", ".join(f'"{field[0]}" {field[1]}' for field in fields)
         await self.execute_query(
             f"""
@@ -292,12 +315,125 @@ class DatabricksClient:
             fetch_results=False,
         )
 
-    async def adelete_table(self, table_name: str, not_found_ok: bool = True):
+    async def adelete_table(self, table_name: str):
         """Asynchronously delete the Databricks delta table if it exists."""
-        if not_found_ok is True:
-            await self.execute_query(f"DROP TABLE IF EXISTS {table_name}", fetch_results=False)
+        await self.execute_query(f"DROP TABLE IF EXISTS {table_name}", fetch_results=False)
+
+    async def aput_file_stream_to_volume(self, file: io.BytesIO, volume_name: str, file_name: str):
+        """Asynchronously put a local file stream to a Databricks volume."""
+        results = await self.execute_query(
+            f"PUT '__input_stream__' INTO '{volume_name}/{file_name}' OVERWRITE",
+            query_kwargs={"input_stream": file},
+        )
+        # TODO - check results
+
+    async def acopy_into_table_from_volume(self, table_name: str, volume_name: str):
+        """Asynchronously copy data from a Databricks volume into a Databricks table."""
+        results = await self.execute_async_query(
+            f"COPY INTO {table_name} FROM '{volume_name}' FILEFORMAT = PARQUET",
+        )
+
+    @contextlib.asynccontextmanager
+    async def managed_volume(self, volume: str):
+        """Manage a volume in Databricks by ensuring it exists while in context."""
+        self.logger.info("Creating Databricks volume %s", volume)
+        await self.acreate_volume(volume)
+        yield volume
+        self.logger.info("Deleting Databricks volume %s", volume)
+        await self.adelete_volume(volume)
+
+    async def acreate_volume(self, volume: str):
+        """Asynchronously create a Databricks volume."""
+        await self.execute_query(
+            f"CREATE VOLUME IF NOT EXISTS {volume} COMMENT 'PostHog generated volume'",
+            fetch_results=False,
+        )
+
+    async def adelete_volume(self, volume: str):
+        """Asynchronously delete a Databricks volume."""
+        await self.execute_query(
+            f"DROP VOLUME IF EXISTS {volume}",
+            fetch_results=False,
+        )
+
+    async def aget_table_columns(self, table_name: str) -> list[str]:
+        """Asynchronously get the columns of a Databricks table.
+
+        The Databricks connector has dedicated methods for retrieving metadata.
+        """
+        with self.connection.cursor() as cursor:
+            await asyncio.to_thread(cursor.columns, table_name=table_name)
+            results = await asyncio.to_thread(cursor.fetchall)
+            # TODO - check results
+            return [row.name for row in results]
+
+    async def amerge_mutable_tables(
+        self,
+        target_table: str,
+        source_table: str,
+        merge_key: collections.abc.Iterable[DatabricksField],
+        update_key: collections.abc.Iterable[str],
+        fields: collections.abc.Iterable[DatabricksField],
+        with_schema_evolution: bool = True,
+    ):
+        """Merge data from source_table into target_table in Databricks.
+
+        If `with_schema_evolution` is True, we will use `WITH SCHEMA EVOLUTION` to enable [automatic schema
+        evolution](https://docs.databricks.com/aws/en/delta/update-schema#automatic-schema-evolution-for-delta-lake-merge).
+        This means the target table will automatically be updated with the schema of the source table (however, no
+        columns will be dropped from the target table).
+
+        Otherwise, we use the more manual approach of getting the column names from the target table and then specifying
+        the individual columns in the `MERGE` query to update the target table.
+        """
+
+        # TODO - add tests to test this SQL
+
+        assert merge_key, "Merge key must be defined"
+        assert update_key, "Update key must be defined"
+        assert fields, "Fields must be defined"
+
+        merge_condition = " AND ".join([f'target."{field[0]}" = source."{field[0]}"' for field in merge_key])
+
+        update_condition = " OR ".join([f'target."{field[0]}" < source."{field[0]}"' for field in update_key])
+
+        if with_schema_evolution is True:
+            merge_query = f"""
+            MERGE WITH SCHEMA EVOLUTION INTO {target_table} AS target
+            USING {source_table} AS source
+            ON {merge_condition}
+            WHEN MATCHED AND ({update_condition}) THEN
+                UPDATE SET *
+            WHEN NOT MATCHED THEN
+                INSERT *
+            """
         else:
-            await self.execute_query(f"DROP TABLE {table_name}", fetch_results=False)
+            # first we need to get the column names from the target table
+            target_table_field_names = await self.aget_table_columns(target_table)
+
+            update_clause = ", ".join(
+                [
+                    f'target."{field[0]}" = source."{field[0]}"'
+                    for field in fields
+                    if field[0] in target_table_field_names
+                ]
+            )
+            field_names = ", ".join([f'"{field[0]}"' for field in fields if field[0] in target_table_field_names])
+            values = ", ".join([f'source."{field[0]}"' for field in fields if field[0] in target_table_field_names])
+
+            merge_query = f"""
+            MERGE INTO {target_table} AS target
+            USING {source_table} AS source
+            ON {merge_condition}
+            WHEN MATCHED AND ({update_condition}) THEN
+                UPDATE SET
+                    {update_clause}
+            WHEN NOT MATCHED THEN
+                INSERT ({field_names})
+                VALUES ({values})
+            """
+
+        await self.execute_async_query(merge_query, fetch_results=False)
 
 
 def databricks_default_fields() -> list[BatchExportField]:
@@ -420,76 +556,89 @@ def _get_databricks_merge_config(
     return requires_merge, merge_key, update_key
 
 
-# TODO
 class DatabricksConsumer(Consumer):
-    """A consumer that uploads data to Databricks from the internal stage."""
+    """A consumer that uploads data to a Databricks managed volume."""
 
-    # def __init__(
-    #     self,
-    #     snowflake_client: SnowflakeClient,
-    #     snowflake_table: str,
-    #     snowflake_table_stage_prefix: str,
-    # ):
-    #     super().__init__()
+    def __init__(
+        self,
+        client: DatabricksClient,
+        volume_name: str,
+    ):
+        super().__init__()
 
-    #     self.snowflake_client = snowflake_client
-    #     self.snowflake_table = snowflake_table
-    #     self.snowflake_table_stage_prefix = snowflake_table_stage_prefix
+        self.client = client
+        self.volume_name = volume_name
 
-    #     # Simple file management - no concurrent uploads for now
-    #     self.current_file_index = 0
-    #     self.current_buffer = NamedBytesIO(
-    #         b"", name=f"{self.snowflake_table_stage_prefix}/{self.current_file_index}.parquet.zst"
-    #     )
+        self.logger.bind(
+            volume=self.volume_name,
+        )
 
-    # async def consume_chunk(self, data: bytes):
-    #     """Consume a chunk of data by writing it to the current buffer."""
-    #     self.current_buffer.write(data)
+        self.current_file_index = 0
+        self.current_buffer = io.BytesIO()
 
-    # async def finalize_file(self):
-    #     """Finalize the current file and start a new one."""
-    #     await self._upload_current_buffer()
+    async def consume_chunk(self, data: bytes):
+        """Consume a chunk of data by writing it to the current buffer."""
+        self.current_buffer.write(data)
+        await asyncio.sleep(0)
 
-    # def _start_new_file(self):
-    #     """Start a new file (reset state for file splitting)."""
-    #     self.current_file_index += 1
-    #     self.current_buffer = NamedBytesIO(
-    #         b"", name=f"{self.snowflake_table_stage_prefix}/{self.current_file_index}.parquet.zst"
-    #     )
+    async def finalize_file(self):
+        """Finalize the current file and start a new one."""
+        await self._upload_current_buffer()
+        self._start_new_file()
 
-    # async def _upload_current_buffer(self):
-    #     """Upload the current buffer to Snowflake, then start a new one."""
-    #     buffer_size = self.current_buffer.tell()
-    #     if buffer_size == 0:
-    #         return  # Nothing to upload
+    def _start_new_file(self):
+        self.current_file_index += 1
 
-    #     self.logger.info(
-    #         "Uploading file %d with %d bytes to Snowflake table '%s'",
-    #         self.current_file_index,
-    #         buffer_size,
-    #         self.snowflake_table,
-    #     )
+    async def _upload_current_buffer(self):
+        """Upload the current buffer to Databricks, then start a new one."""
+        buffer_size = self.current_buffer.tell()
+        if buffer_size == 0:
+            return  # Nothing to upload
 
-    #     self.current_buffer.seek(0)
+        self.logger.info(
+            "Uploading file %d with %d bytes to Databricks volume '%s'",
+            self.current_file_index,
+            buffer_size,
+            self.volume_name,
+        )
 
-    #     await self.snowflake_client.put_file_to_snowflake_table_stage(
-    #         file=self.current_buffer,
-    #         table_stage_prefix=self.snowflake_table_stage_prefix,
-    #         table_name=self.snowflake_table,
-    #     )
+        self.current_buffer.seek(0)
 
-    #     self.external_logger.info(
-    #         "File %d with %d bytes uploaded to Snowflake table '%s'",
-    #         self.current_file_index,
-    #         buffer_size,
-    #         self.snowflake_table,
-    #     )
+        await self.client.aput_file_stream_to_volume(
+            file=self.current_buffer,
+            volume_name=self.volume_name,
+            file_name=f"{self.current_file_index}.parquet",
+        )
 
-    #     self._start_new_file()
+        self.external_logger.info(
+            "File %d with %d bytes uploaded to Databricks volume '%s'",
+            self.current_file_index,
+            buffer_size,
+            self.volume_name,
+        )
+        self.current_buffer = io.BytesIO()
 
-    # async def finalize(self):
-    #     """Finalize by uploading any remaining data."""
-    #     await self._upload_current_buffer()
+    async def finalize(self):
+        """Finalize by uploading any remaining data."""
+        await self._upload_current_buffer()
+
+
+@contextlib.asynccontextmanager
+async def manage_resources(
+    client: DatabricksClient,
+    volume_name: str,
+    fields: list[DatabricksField],
+    table_name: str,
+    stage_table_name: str | None = None,
+) -> t.AsyncGenerator[tuple[str, str, str | None], None]:
+    """Manage resources in Databricks by ensuring they exist while in context."""
+    async with client.managed_volume(volume_name) as volume:
+        async with client.managed_table(table_name, fields, delete=False) as table:
+            if stage_table_name is not None:
+                async with client.managed_table(stage_table_name, fields, delete=True) as stage_table:
+                    yield volume, table, stage_table
+            else:
+                yield volume, table, None
 
 
 @activity.defn
@@ -552,28 +701,22 @@ async def insert_into_databricks_activity_from_stage(inputs: DatabricksInsertInp
         requires_merge, merge_key, update_key = _get_databricks_merge_config(model=model)
 
         data_interval_end_str = dt.datetime.fromisoformat(inputs.data_interval_end).strftime("%Y-%m-%d_%H-%M-%S")
-        stage_table_name = (
-            f"stage_{inputs.table_name}_{data_interval_end_str}_{inputs.team_id}"
-            if requires_merge
-            else inputs.table_name
+        stage_table_name: str | None = (
+            f"stage_{inputs.table_name}_{data_interval_end_str}_{inputs.team_id}" if requires_merge else None
         )
+        volume_name = f"stage_{inputs.table_name}_{data_interval_end_str}_{inputs.team_id}"
 
         async with DatabricksClient.from_inputs(inputs).connect() as databricks_client:
-            async with (
-                databricks_client.managed_table(
-                    table_name=inputs.table_name, fields=table_fields, delete=False
-                ) as databricks_table,
-                databricks_client.managed_table(
-                    table_name=stage_table_name,
-                    fields=table_fields,
-                    create=requires_merge,
-                    delete=requires_merge,
-                ) as databricks_stage_table,
+            async with manage_resources(
+                client=databricks_client,
+                volume_name=volume_name,
+                fields=table_fields,
+                table_name=inputs.table_name,
+                stage_table_name=stage_table_name,
             ):
-                consumer = DatabricksConsumerFromStage(
-                    snowflake_client=snow_client,
-                    snowflake_table=snow_stage_table if requires_merge else snow_table,
-                    snowflake_table_stage_prefix=data_interval_end_str,
+                consumer = DatabricksConsumer(
+                    client=databricks_client,
+                    volume_name=volume_name,
                 )
 
                 result = await run_consumer_from_stage(
@@ -584,28 +727,27 @@ async def insert_into_databricks_activity_from_stage(inputs: DatabricksInsertInp
                     file_format="Parquet",
                     # TODO - add compression
                     # compression="zstd",
+                    compression=None,
                     include_inserted_at=False,
-                    max_file_size_bytes=settings.BATCH_EXPORT_SNOWFLAKE_UPLOAD_CHUNK_SIZE_BYTES,
+                    max_file_size_bytes=settings.BATCH_EXPORT_DATABRICKS_UPLOAD_CHUNK_SIZE_BYTES,
                     json_columns=known_variant_columns,
                 )
 
                 # TODO - maybe move this into the consumer finalize method?
                 # Copy all staged files to the table
-                await snow_client.copy_loaded_files_to_snowflake_table(
-                    snow_stage_table if requires_merge else snow_table,
-                    data_interval_end_str,
-                    table_fields,
-                    file_format="Parquet",
-                    known_json_columns=known_variant_columns,
+                await databricks_client.acopy_into_table_from_volume(
+                    table_name=stage_table_name if stage_table_name else inputs.table_name,
+                    volume_name=volume_name,
                 )
 
-                if requires_merge:
-                    await snow_client.amerge_mutable_tables(
-                        final_table=snow_table,
-                        stage_table=snow_stage_table,
-                        update_when_matched=table_fields,
+                if requires_merge and stage_table_name is not None:
+                    await databricks_client.amerge_mutable_tables(
+                        target_table=inputs.table_name,
+                        source_table=stage_table_name,
+                        fields=table_fields,
                         merge_key=merge_key,
                         update_key=update_key,
+                        with_schema_evolution=inputs.use_automatic_schema_evolution,
                     )
 
                 return result
