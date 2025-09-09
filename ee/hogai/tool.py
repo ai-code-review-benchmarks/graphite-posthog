@@ -40,6 +40,9 @@ class search_insights(BaseModel):
     """
     Search through existing insights to find matches based on the user's query.
     Use this tool when users ask to find, search for, or look up existing insights.
+    IMPORTANT: NEVER CALL THIS TOOL IF THE USER ASKS TO CREATE A DASHBOARD.
+    Only use this tool when users ask to find, search for, or look up insights.
+    If the user asks to create a dashboard, use the `create_dashboard` tool instead.
     """
 
     search_query: str = Field(
@@ -105,6 +108,31 @@ class session_summarization(BaseModel):
             - and similar
           * If there's not enough context to generated the summary name - keep it an empty string ("")
         """
+    )
+
+
+class create_dashboard(BaseModel):
+    """
+    Create a dashboard with insights based on the user's request.
+    Use this tool when users ask to create, build, or make a new dashboard with insights.
+    This tool will search for existing insights that match the user's requirements,
+    or create new insights if none are found, then combine them into a dashboard.
+    Do not call the `search_insights` tool if this tool is used.
+    """
+
+    search_insights_queries: list[str] = Field(
+        description="A short description of the insights that are mentioned by the user and need to be included in the dashboard."
+        "Include all relevant context from earlier messages too, as the tool won't see that conversation history. If the user asks to search for multiple insights, pass a list of insights descriptions. Be concise and to the point."
+    )
+    create_dashboard_query: str = Field(
+        description=(
+            "The user's complete request for dashboard creation. "
+            "Include all relevant context from earlier messages too, as the tool won't see that conversation history. "
+            "Examples: "
+            "'Create a dashboard showing user engagement metrics with signup funnel and retention data' "
+            "'Build a revenue dashboard with conversion rates and top performing features' "
+            "'Make a product analytics dashboard tracking feature usage and user behavior'"
+        )
     )
 
 
