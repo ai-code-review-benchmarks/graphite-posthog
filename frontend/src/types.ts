@@ -1980,6 +1980,12 @@ export interface BillingType {
         email?: string
         name?: string
     }
+    usage_summary?: {
+        [key: string]: {
+            usage?: number | null
+            limit?: number | null
+        }
+    }
 }
 
 export interface BillingPeriod {
