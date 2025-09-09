@@ -320,13 +320,13 @@ export const HOG_FUNCTION_SUB_TEMPLATES: Record<HogFunctionSubTemplateIdType, Ho
         },
         {
             ...HOG_FUNCTION_SUB_TEMPLATE_COMMON_PROPERTIES['error-tracking-issue-created'],
-            template_id: 'template-linear',
+            template_id: 'template-linear-from-exception',
             name: 'Linear issue on issue created',
             description: 'Create an issue in Linear when an issue is created.',
         },
         {
             ...HOG_FUNCTION_SUB_TEMPLATE_COMMON_PROPERTIES['error-tracking-issue-created'],
-            template_id: 'template-github',
+            template_id: 'template-github-from-exception',
             name: 'GitHub issue on issue created',
             description: 'Create an issue in GitHub when an issue is created.',
         },

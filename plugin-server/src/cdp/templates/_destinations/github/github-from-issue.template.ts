@@ -1,10 +1,12 @@
 import { HogFunctionTemplate } from '~/cdp/types'
 
+// this template is intended to be used in error tracking alerts only (because it uses special internal event "$error_tracking_issue_created")
+
 export const template: HogFunctionTemplate = {
     status: 'stable',
     free: false,
     type: 'destination',
-    id: 'template-github',
+    id: 'template-github-from-issue',
     name: 'GitHub',
     description: 'Creates an issue in a GitHub repository',
     icon_url: '/static/services/github.png',
