@@ -84,6 +84,7 @@ export interface DashboardLogicProps {
     id: number
     dashboard?: DashboardType<QueryBasedInsightModel>
     placement?: DashboardPlacement
+    variables?: { code_name: string; value: any }[]
 }
 
 export interface RefreshStatus {
@@ -213,6 +214,7 @@ export const dashboardLogic = kea<dashboardLogicType>([
             value,
             isNull,
         }),
+        overrideVariableValueByCodeName: (codeName: string, value: any) => ({ codeName, value }),
 
         /**
          * Dashboard state.
@@ -1260,19 +1262,17 @@ export const dashboardLogic = kea<dashboardLogicType>([
                     // Ensure loading state is properly initialized for shared dashboards
                     actions.loadingDashboardItemsStarted(DashboardLoadAction.InitialLoad)
                     actions.loadDashboardSuccess(props.dashboard)
-                } else {
-                    if (!(SEARCH_PARAM_QUERY_VARIABLES_KEY in router.values.searchParams)) {
-                        if (values.shouldUseStreaming) {
-                            // Streaming loading: load metadata + stream tiles
-                            actions.loadDashboardStreaming({
-                                action: DashboardLoadAction.InitialLoad,
-                            })
-                        } else {
-                            // Regular loading
-                            actions.loadDashboard({
-                                action: DashboardLoadAction.InitialLoad,
-                            })
-                        }
+                } else if (!(SEARCH_PARAM_QUERY_VARIABLES_KEY in router.values.searchParams)) {
+                    if (values.shouldUseStreaming) {
+                        // Streaming loading: load metadata + stream tiles
+                        actions.loadDashboardStreaming({
+                            action: DashboardLoadAction.InitialLoad,
+                        })
+                    } else {
+                        // Regular loading
+                        actions.loadDashboard({
+                            action: DashboardLoadAction.InitialLoad,
+                        })
                     }
                 }
             }
@@ -1784,11 +1784,26 @@ export const dashboardLogic = kea<dashboardLogicType>([
             })
             actions.setDashboardMode(DashboardMode.Edit, null)
         },
+        overrideVariableValueByCodeName: ({ codeName }) => {
+            const variable = values.variables.find((v: Variable) => v.code_name === codeName)
+            if (variable) {
+                actions.refreshDashboardItems({
+                    action: RefreshDashboardItemsAction.Preview,
+                    forceRefresh: false,
+                })
+            }
+        },
         [variableDataLogic.actionTypes.getVariablesSuccess]: () => {
             // Only run this handler once on startup
             // This ensures variables are loaded before the dashboard is loaded and insights are refreshed
             if (values.initialVariablesLoaded) {
                 return
+            }
+
+            if (props.variables) {
+                props.variables.forEach((variable) => {
+                    actions.overrideVariableValueByCodeName(variable.code_name, variable.value)
+                })
             }
 
             if (SEARCH_PARAM_QUERY_VARIABLES_KEY in router.values.searchParams) {
@@ -1923,6 +1938,30 @@ export const dashboardLogic = kea<dashboardLogicType>([
             const newUrlVariables: Record<string, string> = {
                 ...urlVariables,
                 [currentVariable.code_name]: value,
+            }
+
+            const newSearchParams = {
+                ...currentLocation.searchParams,
+            }
+
+            return [
+                currentLocation.pathname,
+                { ...newSearchParams, ...encodeURLVariables(newUrlVariables) },
+                currentLocation.hashParams,
+            ]
+        },
+        overrideVariableValueByCodeName: ({ codeName, value }) => {
+            const { currentLocation } = router.values
+
+            const currentVariable = values.variables.find((v: Variable) => v.code_name === codeName)
+            if (!currentVariable) {
+                return [currentLocation.pathname, currentLocation.searchParams, currentLocation.hashParams]
+            }
+
+            const urlVariables = parseURLVariables(currentLocation.searchParams)
+            const newUrlVariables: Record<string, string> = {
+                ...urlVariables,
+                [codeName]: value,
             }
 
             const newSearchParams = {
