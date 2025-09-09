@@ -13,19 +13,31 @@ export const template: HogFunctionTemplate = {
     code: `fun create_issue() {
     let owner := inputs.github_installation.account.name
     let repo := inputs.repository
-    let title := event.properties.$exception_types[1]
-    let description := event.properties.$exception_values[1]
-    let issue_id := event.properties.$exception_issue_id
+    let title := event.properties.name
+    let description := event.properties.description
+    let posthog_issue_id := event.distinct_id
+
+    if (not owner) {
+        throw Error('Owner is required')
+    }
 
     if (not repo) {
-        throw Error('Repository is required (expected format org/repo)')
+        throw Error('Repository is required')
     }
 
     if (not title) {
         throw Error('Issue title is required')
     }
 
-    let posthog_issue_url := f'{project.url}/error_tracking/{issue_id}'
+    if (not description) {
+        throw Error('Issue description is required')
+    }
+
+    if (not posthog_issue_id) {
+        throw Error('PostHog issue ID is required')
+    }
+
+    let posthog_issue_url := f'{project.url}/error_tracking/{posthog_issue_id}'
     let payload := {
         'method': 'POST',
         'headers': {
