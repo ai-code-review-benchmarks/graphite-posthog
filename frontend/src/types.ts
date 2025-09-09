@@ -4467,6 +4467,7 @@ export type APIScopeObject =
     | 'cohort'
     | 'dashboard'
     | 'dashboard_template'
+    | 'dataset'
     | 'early_access_feature'
     | 'error_tracking'
     | 'event_definition'
