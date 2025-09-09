@@ -38,11 +38,6 @@ import { SceneDivider } from '~/layout/scenes/components/SceneDivider'
 import { SceneSection } from '~/layout/scenes/components/SceneSection'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
 import { Query } from '~/queries/Query/Query'
-import { AndOrFilterSelect } from '~/queries/nodes/InsightViz/PropertyGroupFilters/AndOrFilterSelect'
-
-import { AddPersonToCohortModal } from './AddPersonToCohortModal'
-import { addPersonToCohortModalLogic } from './addPersonToCohortModalLogic'
-import { createCohortDataNodeLogicKey } from './cohortUtils'
 
 const RESOURCE_TYPE = 'cohort'
 
@@ -57,7 +52,7 @@ export function CohortEdit({ id }: CohortLogicProps): JSX.Element {
     const isNewCohort = cohort.id === 'new' || cohort.id === undefined
     const { featureFlags } = useValues(featureFlagLogic)
     const newSceneLayout = featureFlags[FEATURE_FLAGS.NEW_SCENE_LAYOUT]
-    const dataNodeLogicKey = createCohortDataNodeLogicKey(cohort.id)
+
 
     if (cohortMissing) {
         return <NotFound object="cohort" />
@@ -341,147 +336,7 @@ export function CohortEdit({ id }: CohortLogicProps): JSX.Element {
                                 </LemonField>
                             </div>
                         )}
-                    </SceneSection>
-                    {cohort.is_static ? (
-                        <>
-                            <SceneDivider />
-                            <SceneSection
-                                title={isNewCohort ? 'Upload users' : 'Add users'}
-                                description={
-                                    isNewCohort
-                                        ? `Upload a CSV file to add users to your cohort. For single-column files, include
-                                        one distinct ID per row (all rows will be processed as data). For multi-column
-                                        files, include a header row with a 'distinct_id' column containing the user
-                                        identifiers.`
-                                        : undefined
-                                }
-                                className={cn('ph-ignore-input', !newSceneLayout && 'mt-4')}
-                            >
-                                {!isNewCohort && newSceneLayout && (
-                                    <div className="flex flex-col gap-y-0 flex-1 justify-center">
-                                        <h3 className="text-sm">Upload a CSV</h3>
-                                        <span className="max-w-prose">
-                                            Upload a CSV file to add users to your cohort. For single-column files,
-                                            include one distinct ID per row (all rows will be processed as data). For
-                                            multi-column files, include a header row with a 'distinct_id' column
-                                            containing the user identifiers.
-                                        </span>
-                                    </div>
-                                )}
-                                {/* TODO: @adamleithp Allow users to download a template CSV file */}
-                                {/* TODO: @adamleithp Tell users that adding ANOTHER file will NOT(?) replace the current one */}
-                                {/* TODO: @adamleithp Render the csv file and validate it */}
-                                {/* TODO: @adamleithp Adding a csv file doesn't show up with cohort.csv... */}
-                                <LemonField
-                                    name="csv"
-                                    label={newSceneLayout ? null : isNewCohort ? null : 'Upload users'}
-                                    data-attr="cohort-csv"
-                                >
-                                    {({ onChange }) => (
-                                        <>
-                                            {!newSceneLayout && !isNewCohort && (
-                                                <div className="flex items-center gap-2">
-                                                    <span>
-                                                        Upload a CSV file to add users to your cohort using distinct IDs
-                                                        or person UUIDs.
-                                                    </span>
-                                                    <Tooltip
-                                                        title={
-                                                            <>
-                                                                <div className="space-y-2">
-                                                                    <div>
-                                                                        <strong>Distinct IDs:</strong> Use "
-                                                                        <code>distinct_id</code>" (or "
-                                                                        <code>distinct-id</code>") as the column header
-                                                                        (for multi-column CSV uploads) or include one
-                                                                        distinct ID per row (no header needed) for a
-                                                                        single-column CSV.
-                                                                    </div>
-                                                                    <div>
-                                                                        <strong>Person UUIDs:</strong> Use "
-                                                                        <code>person_id</code>" (or "
-                                                                        <code>person-id</code>" or "
-                                                                        <code>Person .id</code>") as the column header
-                                                                        (for single-column or multi-column CSV uploads).
-                                                                    </div>
-                                                                </div>
-                                                            </>
-                                                        }
-                                                    >
-                                                        <IconInfo className="text-secondary text-lg" />
-                                                    </Tooltip>
-                                                </div>
-                                            )}
-                                            <LemonFileInput
-                                                accept=".csv"
-                                                multiple={false}
-                                                value={cohort.csv ? [cohort.csv] : []}
-                                                onChange={(files) => onChange(files[0])}
-                                                showUploadedFiles={false}
-                                                callToAction={
-                                                    <div
-                                                        className={cn(
-                                                            'flex flex-col items-center justify-center flex-1 cohort-csv-dragger text-text-3000 deprecated-space-y-1',
-                                                            newSceneLayout &&
-                                                                'text-primary mt-0 bg-transparent border border-dashed border-primary hover:border-secondary p-8',
-                                                            newSceneLayout && cohort.csv?.name && 'border-success'
-                                                        )}
-                                                    >
-                                                        {cohort.csv ? (
-                                                            <>
-                                                                <IconUploadFile
-                                                                    style={{
-                                                                        fontSize: '3rem',
-                                                                        color: !newSceneLayout
-                                                                            ? 'var(--color-text-secondary)'
-                                                                            : 'var(--color-text-primary)',
-                                                                    }}
-                                                                />
-                                                                <div>{cohort.csv?.name ?? 'File chosen'}</div>
-                                                            </>
-                                                        ) : (
-                                                            <>
-                                                                <IconUploadFile
-                                                                    style={{
-                                                                        fontSize: '3rem',
-                                                                        color: !newSceneLayout
-                                                                            ? 'var(--color-text-secondary)'
-                                                                            : 'var(--color-text-primary)',
-                                                                    }}
-                                                                />
-                                                                <div>
-                                                                    Drag a file here or click to browse for a file
-                                                                </div>
-                                                                {newSceneLayout && (
-                                                                    <div className="text-secondary text-xs">
-                                                                        Accepts .csv files only
-                                                                    </div>
-                                                                )}
-                                                            </>
-                                                        )}
-                                                    </div>
-                                                }
-                                            />
-                                        </>
-                                    )}
-                                </LemonField>
-                            </SceneSection>
-                            {!isNewCohort && (
-                                <>
-                                    <LemonDivider label="OR" />
-                                    <div>
-                                        <h3 className="text-sm">Add users manually</h3>
-                                        <span className="max-w-prose">
-                                            Select the users that you would like to add to the cohort.
-                                        </span>
-                                        <LemonButton
-                                            className="w-fit mt-4"
-                                            type="primary"
-                                            onClick={showAddPersonToCohortModal}
-                                        >
-                                            Add Users
-                                        </LemonButton>
-                                    </div>
+
                                 </>
                             )}
                         </>
@@ -587,6 +442,15 @@ export function CohortEdit({ id }: CohortLogicProps): JSX.Element {
                     )}
                 </SceneContent>
             </Form>
+
+            {/* User search modal for static cohorts */}
+            {!isNewCohort && cohort.is_static && (
+                <CohortUserSearch
+                    cohortId={cohort.id as number}
+                    isOpen={isUserSearchOpen}
+                    onClose={() => setIsUserSearchOpen(false)}
+                />
+            )}
         </div>
     )
 }
