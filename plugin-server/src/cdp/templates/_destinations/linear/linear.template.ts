@@ -1,12 +1,10 @@
 import { HogFunctionTemplate } from '~/cdp/types'
 
-// this template is intended to be used in CDP
-
 export const template: HogFunctionTemplate = {
     status: 'stable',
     free: false,
     type: 'destination',
-    id: 'template-linear-from-exception',
+    id: 'template-linear',
     name: 'Linear',
     description: 'Creates an issue for a Linear team',
     icon_url: '/static/services/linear.png',
@@ -25,7 +23,7 @@ export const template: HogFunctionTemplate = {
     })
 }
 
-let issue_mutation := f'mutation IssueCreate \\{ issueCreate(input: \\{ title: "{event.properties.$exception_types[1]}" description: "{event.properties.$exception_values[1]}" teamId: "{inputs.team}" }) \\{ success issue \\{ identifier } } }';
+let issue_mutation := f'mutation IssueCreate \\{ issueCreate(input: \\{ title: "{event.properties.name}" description: "{event.properties.description}" teamId: "{inputs.team}" }) \\{ success issue \\{ identifier } } }';
 
 let issue_response := query(issue_mutation);
 
@@ -35,7 +33,7 @@ if (issue_response.status != 200) {
 
 let linear_issue_id := issue_response.body.data.issueCreate.issue.identifier;
 
-let attachment_url := f'{project.url}/error_tracking/{event.properties.$exception_issue_id}';
+let attachment_url := f'{project.url}/error_tracking/{event.distinct_id}';
 let attachment_mutation := f'mutation AttachmentCreate \\{ attachmentCreate(input: \\{ issueId: "{linear_issue_id}", title: "PostHog issue", url: "{attachment_url}" }) \\{ success } }';
 
 query(attachment_mutation);`,
