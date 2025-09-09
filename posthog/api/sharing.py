@@ -162,8 +162,13 @@ def export_asset_for_opengraph(resource: SharingConfiguration) -> ExportedAsset 
         context={"team_id": cast(Team, resource.team).pk},
     )
     serializer.is_valid(raise_exception=True)
-    export_asset = serializer.synthetic_create("opengraph image")
-    return export_asset
+
+    try:
+        export_asset = serializer.synthetic_create("opengraph image")
+        return export_asset
+    except Exception as e:
+        capture_exception(e)
+        return None
 
 
 def get_themes_for_team(team: Team):
@@ -523,9 +528,12 @@ class SharingViewerPageViewSet(mixins.RetrieveModelMixin, viewsets.GenericViewSe
         # JWT based access (ExportedAsset)
         token = self.request.query_params.get("token")
         if token:
-            asset = asset_for_token(token)
-            if asset:
-                return asset
+            try:
+                asset = asset_for_token(token)
+                if asset:
+                    return asset
+            except ExportedAsset.DoesNotExist:
+                return None
 
         # Path based access (SharingConfiguration only)
         access_token = self.kwargs.get("access_token", "").split(".")[0]
