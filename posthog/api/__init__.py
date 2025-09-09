@@ -1,7 +1,7 @@
 from rest_framework import decorators, exceptions, viewsets
 from rest_framework_extensions.routers import NestedRegistryItem
 
-from posthog.api import data_color_theme, hog_flow, metalytics, my_notifications, project
+from posthog.api import data_color_theme, hog_flow, hogql_query, metalytics, my_notifications, project
 from posthog.api.batch_imports import BatchImportViewSet
 from posthog.api.csp_reporting import CSPReportingViewSet
 from posthog.api.routing import DefaultRouterPlusPlus
@@ -341,6 +341,13 @@ projects_router.register(
     ["project_id"],
 )
 register_grandfathered_environment_nested_viewset(r"query", query.QueryViewSet, "environment_query", ["team_id"])
+
+register_grandfathered_environment_nested_viewset(
+    r"hogql",
+    hogql_query.HogQLQueryViewSet,
+    "environment_hogql",
+    ["team_id"],
+)
 
 # External data resources
 register_grandfathered_environment_nested_viewset(

@@ -113,6 +113,12 @@ class ExecutionMode(StrEnum):
     """Do not initiate calculation."""
 
 
+ASYNC_MODES: list[ExecutionMode] = [
+    ExecutionMode.CALCULATE_ASYNC_ALWAYS,
+    ExecutionMode.RECENT_CACHE_CALCULATE_ASYNC_IF_STALE,
+    ExecutionMode.EXTENDED_CACHE_CALCULATE_ASYNC_IF_STALE,
+]
+
 _REFRESH_TO_EXECUTION_MODE: dict[str | bool, ExecutionMode] = {
     **ExecutionMode._value2member_map_,  # type: ignore
     True: ExecutionMode.CALCULATE_BLOCKING_ALWAYS,
