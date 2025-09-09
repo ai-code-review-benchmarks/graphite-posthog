@@ -1,13 +1,13 @@
 import { useValues } from 'kea'
 
-import { LemonInputSelect, LemonSkeleton } from '@posthog/lemon-ui'
+import { LemonSkeleton } from '@posthog/lemon-ui'
 
 import {
     ClickUpListPicker,
     ClickUpSpacePicker,
     ClickUpWorkspacePicker,
 } from 'lib/integrations/ClickUpIntegrationHelpers'
-import { useRepositories } from 'lib/integrations/GitHubIntegrationHelpers'
+import { GitHubRepositoryPicker } from 'lib/integrations/GitHubIntegrationHelpers'
 import {
     GoogleAdsConversionActionPicker,
     GoogleAdsCustomerIdPicker,
@@ -149,18 +149,7 @@ export function CyclotronJobInputIntegrationField({
         return <LinearTeamPicker value={value} onChange={(x) => onChange?.(x)} integration={integration} />
     }
     if (schema.integration_field === 'github_repository') {
-        const { options, loading } = useRepositories(integration.id)
-        return (
-            <LemonInputSelect
-                onChange={(val) => onChange?.(val[0] ?? null)}
-                value={value ? [value] : []}
-                mode="single"
-                data-attr="select-github-repository"
-                placeholder="Select a repository..."
-                options={options}
-                loading={loading}
-            />
-        )
+        return <GitHubRepositoryPicker value={value} onChange={(x) => onChange?.(x)} integrationId={integration.id} />
     }
     if (schema.integration_field === 'twilio_phone_number') {
         return <TwilioPhoneNumberPicker value={value} onChange={(x) => onChange?.(x)} integration={integration} />
