@@ -7,19 +7,16 @@ import { MessageSizeTooLarge } from '~/utils/db/error'
 import { captureIngestionWarning } from '~/worker/ingestion/utils'
 
 import { HogTransformerService } from '../cdp/hog-transformations/hog-transformer.service'
-import { KafkaConsumer, parseEventHeaders, parseKafkaHeaders } from '../kafka/consumer'
+import { KafkaConsumer, parseKafkaHeaders } from '../kafka/consumer'
 import { KafkaProducerWrapper } from '../kafka/producer'
 import { ingestionOverflowingMessagesTotal } from '../main/ingestion-queues/batch-processing/metrics'
-import {
-    eventDroppedCounter,
-    latestOffsetTimestampGauge,
-    setUsageInNonPersonEventsCounter,
-} from '../main/ingestion-queues/metrics'
+import { latestOffsetTimestampGauge, setUsageInNonPersonEventsCounter } from '../main/ingestion-queues/metrics'
 import {
     EventHeaders,
     HealthCheckResult,
     HealthCheckResultError,
     Hub,
+    IncomingEvent,
     IncomingEventWithTeam,
     KafkaConsumerBreadcrumb,
     KafkaConsumerBreadcrumbSchema,
@@ -38,16 +35,19 @@ import { BatchWritingGroupStore } from '../worker/ingestion/groups/batch-writing
 import { GroupStoreForBatch } from '../worker/ingestion/groups/group-store-for-batch.interface'
 import { BatchWritingPersonsStore } from '../worker/ingestion/persons/batch-writing-person-store'
 import { FlushResult, PersonsStoreForBatch } from '../worker/ingestion/persons/persons-store-for-batch'
+import { PipelineConfig, ResultHandlingPipeline } from '../worker/ingestion/result-handling-pipeline'
 import { deduplicateEvents } from './deduplication/events'
 import { DeduplicationRedis, createDeduplicationRedis } from './deduplication/redis-client'
 import {
-    applyDropEventsRestrictions,
-    applyForceOverflowRestrictions,
-    applyPersonProcessingRestrictions,
-    parseKafkaMessage,
-    resolveTeam,
-    validateEventUuid,
+    createApplyDropRestrictionsStep,
+    createApplyForceOverflowRestrictionsStep,
+    createApplyPersonProcessingRestrictionsStep,
+    createParseHeadersStep,
+    createParseKafkaMessageStep,
+    createResolveTeamStep,
+    createValidateEventUuidStep,
 } from './event-preprocessing'
+import { AsyncPreprocessingStep, SyncPreprocessingStep } from './processing-pipeline'
 import { MemoryRateLimiter } from './utils/overflow-detector'
 
 const ingestionEventOverflowed = new Counter({
@@ -111,6 +111,30 @@ export class IngestionConsumer {
     private deduplicationRedis: DeduplicationRedis
     public readonly promiseScheduler = new PromiseScheduler()
 
+    // Pipeline steps - constructed once in constructor
+    private parseHeadersStep: SyncPreprocessingStep<Message, { message: Message; headers: EventHeaders }>
+    private applyDropRestrictionsStep: SyncPreprocessingStep<
+        { message: Message; headers: EventHeaders },
+        { message: Message; headers: EventHeaders }
+    >
+    private parseKafkaMessageStep: SyncPreprocessingStep<
+        { message: Message; headers: EventHeaders },
+        { message: Message; headers: EventHeaders; event: IncomingEvent }
+    >
+    private resolveTeamStep: AsyncPreprocessingStep<
+        { message: Message; headers: EventHeaders; event: IncomingEvent },
+        { message: Message; headers: EventHeaders; eventWithTeam: IncomingEventWithTeam }
+    >
+    private applyPersonProcessingRestrictionsStep: SyncPreprocessingStep<
+        { message: Message; headers: EventHeaders; eventWithTeam: IncomingEventWithTeam },
+        IncomingEventWithTeam
+    >
+    private validateEventUuidStep: AsyncPreprocessingStep<IncomingEventWithTeam, IncomingEventWithTeam>
+    private applyForceOverflowRestrictionsStep: SyncPreprocessingStep<
+        { message: Message; headers: EventHeaders },
+        { message: Message; headers: EventHeaders }
+    >
+
     constructor(
         private hub: Hub,
         overrides: Partial<
@@ -170,6 +194,25 @@ export class IngestionConsumer {
             groupId: this.groupId,
             topic: this.topic,
         })
+
+        // Initialize pipeline steps
+        this.parseHeadersStep = createParseHeadersStep()
+        this.applyDropRestrictionsStep = createApplyDropRestrictionsStep(this.eventIngestionRestrictionManager)
+        this.parseKafkaMessageStep = createParseKafkaMessageStep()
+        this.resolveTeamStep = createResolveTeamStep(this.hub)
+        this.applyPersonProcessingRestrictionsStep = createApplyPersonProcessingRestrictionsStep(
+            this.eventIngestionRestrictionManager
+        )
+        this.validateEventUuidStep = createValidateEventUuidStep(this.hub)
+        this.applyForceOverflowRestrictionsStep = createApplyForceOverflowRestrictionsStep(
+            this.eventIngestionRestrictionManager,
+            {
+                overflowEnabled: this.overflowEnabled(),
+                overflowTopic: this.overflowTopic || '',
+                consumerGroupId: this.groupId,
+                preservePartitionLocality: this.hub.INGESTION_OVERFLOW_PRESERVE_PARTITION_LOCALITY,
+            }
+        )
     }
 
     public get service(): PluginServerService {
@@ -625,55 +668,33 @@ export class IngestionConsumer {
     }
 
     private async preprocessEvents(messages: Message[]): Promise<IncomingEventWithTeam[]> {
-        const preprocessedEvents: IncomingEventWithTeam[] = []
-
-        for (const message of messages) {
-            const headers = parseEventHeaders(message.headers)
-
-            if (applyDropEventsRestrictions(this.eventIngestionRestrictionManager, headers)) {
-                eventDroppedCounter
-                    .labels({
-                        event_type: 'analytics',
-                        drop_cause: 'blocked_token',
-                    })
-                    .inc()
-                continue
-            }
-
-            const forceOverflowDecision = applyForceOverflowRestrictions(this.eventIngestionRestrictionManager, headers)
-            if (forceOverflowDecision.shouldRedirect && this.overflowEnabled()) {
-                ingestionEventOverflowed.inc(1)
-                forcedOverflowEventsCounter.inc()
-                void this.promiseScheduler.schedule(
-                    this.emitToOverflow([message], forceOverflowDecision.preservePartitionLocality)
-                )
-                continue
-            }
-
-            const parsedEvent = parseKafkaMessage(message)
-            if (!parsedEvent) {
-                continue
-            }
-
-            const eventWithHeaders = { ...parsedEvent, headers }
-
-            const eventWithTeam = await resolveTeam(this.hub, eventWithHeaders)
-            if (!eventWithTeam) {
-                continue
-            }
-
-            applyPersonProcessingRestrictions(eventWithTeam, this.eventIngestionRestrictionManager)
-
-            // We only validate it here because we want to raise ingestion warnings
-            const validEvent = await validateEventUuid(eventWithTeam, this.hub)
-            if (!validEvent) {
-                continue
-            }
-
-            preprocessedEvents.push(validEvent)
+        const pipelineConfig: PipelineConfig = {
+            kafkaProducer: this.kafkaProducer!,
+            dlqTopic: this.dlqTopic,
+            consumerGroupId: this.groupId,
+            promiseScheduler: this.promiseScheduler,
         }
 
-        return preprocessedEvents
+        const pipelinePromises = messages.map(async (message) => {
+            try {
+                const pipeline = ResultHandlingPipeline.of(message, message, pipelineConfig)
+                    .pipe(this.parseHeadersStep)
+                    .pipe(this.applyDropRestrictionsStep)
+                    .pipe(this.applyForceOverflowRestrictionsStep)
+                    .pipe(this.parseKafkaMessageStep)
+                    .pipeAsync(this.resolveTeamStep)
+                    .pipe(this.applyPersonProcessingRestrictionsStep)
+                    .pipeAsync(this.validateEventUuidStep)
+
+                return await pipeline.unwrap()
+            } catch (error) {
+                console.error('Error processing message in pipeline:', error)
+                throw error
+            }
+        })
+
+        const results = await Promise.all(pipelinePromises)
+        return results.filter((result): result is IncomingEventWithTeam => result !== null)
     }
 
     private groupEventsByDistinctId(messages: IncomingEventWithTeam[]): IncomingEventsByDistinctId {
